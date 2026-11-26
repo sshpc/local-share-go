@@ -32,3 +32,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# 上传文件存储目录（运行时由程序创建）
+uploads/
+
+# 构建产物（*.exe 已在上方覆盖）
+upload-tool-*

@@ -1,0 +1,5 @@
+{
+  "server_addr": "0.0.0.0:8081",
+  "upload_dir": "./uploads",
+  "public_base_url": "http://localhost:8085"
+}
