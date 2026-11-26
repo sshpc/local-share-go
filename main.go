@@ -21,6 +21,10 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// version 由发布流水线通过 -ldflags "-X main.version=v1.0.0" 注入；
+// 本地 go build 则为 dev。
+var version = "dev"
+
 // App 持有服务的全部依赖。
 type App struct {
 	store         *Storage
@@ -273,7 +277,7 @@ func main() {
 		errCh <- srv.Serve(ln)
 	}()
 
-	log.Printf("服务已启动，监听 %s", addr)
+	log.Printf("服务已启动，监听 %s（版本 %s）", addr, version)
 	log.Printf("  本机访问:   http://localhost:%d", port)
 	if app.lanURL != "" {
 		log.Printf("  局域网访问: %s", app.lanURL)

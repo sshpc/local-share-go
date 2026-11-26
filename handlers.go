@@ -35,6 +35,7 @@ type indexData struct {
 	TrashN    int
 	TrashSize string
 	OS        string
+	Version   string
 
 	List  ListResult // 当前分页的文件列表
 	Trash ListResult // 回收站分页
@@ -102,6 +103,7 @@ func (a *App) indexHandler(w http.ResponseWriter, r *http.Request) {
 		TrashN:    stats.TrashFiles,
 		TrashSize: humanSize(stats.TrashSize),
 		OS:        runtime.GOOS,
+		Version:   version,
 		List:      list,
 		Trash:     trash,
 		Page:      page,

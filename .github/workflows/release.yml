@@ -1,0 +1,116 @@
+name: Release
+
+# 打 tag（如 v1.0.0）时自动编译多平台可执行文件，并创建 GitHub Release。
+# 也可以在 Actions 页面手动触发（届时用 workflow_dispatch 输入的版本号）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号，例如 v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64.exe
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "local-share-go-${VERSION}-${{ matrix.suffix }}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-share-go-${{ matrix.suffix }}
+          path: local-share-go-*-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh dist
+
+      # 用 runner 自带的 gh 创建 release，避免额外引入第三方 action
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## 下载即用
+
+          1. 下载适合你系统的文件：
+             - Windows 10/11（绝大多数电脑）→ `windows-amd64.exe`
+             - Windows ARM（部分轻薄本/平板）→ `windows-arm64.exe`
+             - macOS（Apple 芯片）→ `darwin-arm64`
+             - macOS（Intel）→ `darwin-amd64`
+             - Linux → `linux-amd64` / `linux-arm64`
+          2. 双击运行（macOS / Linux 需要先 `chmod +x`）
+          3. 程序会自动打开浏览器，用手机扫页面顶部的二维码即可互传文件
+
+          无需安装，无需管理员权限。首次运行时 Windows 可能弹出「SmartScreen 已阻止」提示，
+          点「更多信息 → 仍要运行」即可（可执行文件没有代码签名证书）。
+          EOF
+          gh release create "$VERSION" dist/* \
+            --title "$VERSION" \
+            --notes-file notes.md \
+            --verify-tag
