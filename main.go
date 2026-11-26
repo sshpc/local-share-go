@@ -1,989 +1,319 @@
 package main
 
 import (
-	"encoding/json"
+	"bytes"
+	"context"
+	"embed"
+	"errors"
 	"fmt"
 	"html/template"
-	"io"
+	"log"
+	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/signal"
+	"strconv"
 	"strings"
-
-	"github.com/google/uuid"
-	"github.com/skip2/go-qrcode"
+	"syscall"
+	"time"
 )
 
-// 配置项（可通过配置文件或环境变量覆盖）
-type Config struct {
-	ServerAddr    string `json:"server_addr"`     // 服务地址和端口
-	UploadDir     string `json:"upload_dir"`      // 文件存储目录
-	PublicBaseURL string `json:"public_base_url"` // 公网可访问的地址
+//go:embed templates/*.html
+var templateFS embed.FS
+
+// App 持有服务的全部依赖。
+type App struct {
+	store         *Storage
+	tpl           *template.Template
+	publicBaseURL string // 对外地址前缀；为空时按请求推导
+	lanURL        string // 局域网访问地址，如 http://192.168.1.10:8081
+	lanIP         string // 探测到的局域网 IP
+	port          int    // 实际监听端口
 }
 
-// 加载配置（从配置文件和环境变量读取，或使用默认值）
-func loadConfig() Config {
-	// 默认配置
-	config := Config{
-		ServerAddr:    "0.0.0.0:8085",
-		UploadDir:     "./uploads",
-		PublicBaseURL: "http://localhost:8085",
+// humanSize 把字节数格式化成便于展示的字符串。
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n/div >= unit && exp < 3 {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTP"[exp])
+}
+
+// templateFuncs 是模板里用到的辅助函数（html/template 不内置算术）。
+func templateFuncs() template.FuncMap {
+	return template.FuncMap{
+		"add": func(a, b int) int { return a + b },
+		"sub": func(a, b int) int { return a - b },
+	}
+}
+
+// parseTemplates 解析内嵌模板。辅助函数必须在解析前注册，
+// 否则模板里的 {{sub .Page 1}} 会在 ParseFS 阶段就报「function not defined」。
+func parseTemplates() (*template.Template, error) {
+	return template.New("root").Funcs(templateFuncs()).ParseFS(templateFS, "templates/*.html")
+}
+
+// newApp 构造应用，启动阶段完成模板解析等一次性准备工作。
+func newApp(cfg Config) (*App, error) {
+	store, err := NewStorage(cfg.UploadDir)
+	if err != nil {
+		return nil, err
 	}
 
-	// 尝试从配置文件读取
-	if data, err := os.ReadFile("config.json"); err == nil {
-		if err := json.Unmarshal(data, &config); err == nil {
-			fmt.Println("已从配置文件加载配置")
+	tpl, err := parseTemplates()
+	if err != nil {
+		return nil, fmt.Errorf("解析模板失败: %w", err)
+	}
+
+	// 把旧版扁平布局（uploads/<uuid><ext>）迁移到新布局，幂等。
+	if n, err := store.MigrateLegacy(); err != nil {
+		log.Printf("检查旧文件迁移时出错: %v", err)
+	} else if n > 0 {
+		log.Printf("已迁移 %d 个旧格式文件到新布局", n)
+	}
+
+	return &App{
+		store:         store,
+		tpl:           tpl,
+		publicBaseURL: strings.TrimSuffix(cfg.PublicBaseURL, "/"),
+	}, nil
+}
+
+// routes 注册路由。使用 Go 1.22+ 的方法与通配符语法，
+// 未匹配的路径自动 404，方法不匹配自动 405。
+func (a *App) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", a.indexHandler)
+	mux.HandleFunc("POST /upload", a.uploadHandler)
+	mux.HandleFunc("GET /r/{id}", a.resultHandler)
+	mux.HandleFunc("GET /d/{id}", a.downloadPageHandler)
+	mux.HandleFunc("GET /download/{id}", a.downloadHandler)
+	mux.HandleFunc("GET /qr/{id}", a.qrHandler)
+	mux.HandleFunc("GET /site-qr", a.siteQRHandler)
+
+	// 文件管理：软删除进回收站、还原、彻底删除、清空回收站。
+	mux.HandleFunc("POST /delete", a.deleteHandler)
+	mux.HandleFunc("POST /restore", a.restoreHandler)
+	mux.HandleFunc("POST /purge", a.purgeHandler)
+	mux.HandleFunc("POST /purge-all", a.purgeAllHandler)
+
+	// 进程内的健康检查，便于部署时探活。
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	return a.recoverer(a.logger(mux))
+}
+
+// baseURL 决定用于拼接下载链接的对外地址。
+//
+// 优先级：
+//  1. 显式配置的 public_base_url；
+//  2. 通过 localhost 打开页面时，改用探测到的局域网地址，
+//     否则手机扫码拿到 localhost 会打不开；
+//  3. 其余情况按请求的 Host 推导（局域网 IP 访问时天然正确）。
+func (a *App) baseURL(r *http.Request) string {
+	if a.publicBaseURL != "" {
+		return a.publicBaseURL
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+
+	// 判断是否为「本机访问」时只看主机名，但拼链接要保留原始 Host（含端口）。
+	hostOnly := r.Host
+	if h, _, err := net.SplitHostPort(hostOnly); err == nil {
+		hostOnly = h
+	}
+
+	if a.lanURL != "" && isLoopbackHost(hostOnly) {
+		return a.lanURL
+	}
+
+	if r.Host == "" {
+		return scheme + "://localhost"
+	}
+	return scheme + "://" + r.Host
+}
+
+func (a *App) downloadURL(r *http.Request, id string) string {
+	return fmt.Sprintf("%s/download/%s", a.baseURL(r), id)
+}
+
+// statusRecorder 记录响应状态码与字节数，供日志使用。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.bytes += int64(n)
+	return n, err
+}
+
+// logger 输出结构化的单行访问日志。
+func (a *App) logger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
 		}
-	}
-
-	// 环境变量覆盖配置文件
-	if value := os.Getenv("SERVER_ADDR"); value != "" {
-		config.ServerAddr = value
-	}
-	if value := os.Getenv("UPLOAD_DIR"); value != "" {
-		config.UploadDir = value
-	}
-	if value := os.Getenv("PUBLIC_BASE_URL"); value != "" {
-		config.PublicBaseURL = value
-	}
-
-	return config
-}
-
-// 全局配置
-var config Config
-
-// 页面数据结构：用于向前端传递下载链接和二维码图片
-type PageData struct {
-	DownloadURL string // 下载链接
-	FileID      string // 文件ID，用于生成二维码URL
-}
-
-func main() {
-	// 加载配置
-	config = loadConfig()
-
-	// 初始化：创建上传目录（如果不存在）
-	if err := os.MkdirAll(config.UploadDir, 0755); err != nil {
-		fmt.Printf("创建上传目录失败：%v\n", err)
-		return
-	}
-
-	// 注册路由
-	http.HandleFunc("/", indexHandler)             // 首页（上传表单）
-	http.HandleFunc("/upload", uploadHandler)      // 文件上传接口
-	http.HandleFunc("/download/", downloadHandler) // 文件下载接口
-	http.HandleFunc("/qr/", qrHandler)             // 二维码图片接口
-
-	fmt.Printf("服务已启动：%s\n", config.ServerAddr)
-	// 启动 Web 服务
-	if err := http.ListenAndServe(config.ServerAddr, nil); err != nil {
-		fmt.Printf("服务启动失败：%v\n", err)
-	}
-}
-
-// 首页处理器：返回上传表单页面
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	// 现代风格的 HTML 上传表单
-	html := `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>文件上传工具</title>
-    <style>
-        :root {
-            --primary-color: #3b82f6;
-            --secondary-color: #64748b;
-            --background-color: #f8fafc;
-            --card-background: #ffffff;
-            --text-color: #1e293b;
-            --success-color: #10b981;
-            --border-radius: 12px;
-            --box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-        }
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background-color: var(--background-color);
-            color: var(--text-color);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 2rem;
-        }
-        
-        .container {
-            max-width: 600px;
-            width: 100%;
-            margin: 0 auto;
-        }
-        
-        header {
-            text-align: center;
-            margin-bottom: 3rem;
-        }
-        
-        h1 {
-            font-size: 2.5rem;
-            font-weight: 700;
-            color: var(--text-color);
-            margin-bottom: 0.5rem;
-        }
-        
-        .subtitle {
-            color: var(--secondary-color);
-            font-size: 1.1rem;
-        }
-        
-        .card {
-            background-color: var(--card-background);
-            border-radius: var(--border-radius);
-            box-shadow: var(--box-shadow);
-            padding: 2rem;
-            margin-bottom: 2rem;
-        }
-        
-        .upload-form {
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-        }
-        
-        .file-input-container {
-            position: relative;
-            border: 2px dashed #cbd5e1;
-            border-radius: var(--border-radius);
-            padding: 3rem;
-            text-align: center;
-            transition: all 0.3s ease;
-        }
-        
-        .file-input-container:hover {
-            border-color: var(--primary-color);
-            background-color: rgba(59, 130, 246, 0.05);
-        }
-        
-        .file-input {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            opacity: 0;
-            cursor: pointer;
-        }
-        
-        .file-input-label {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 1rem;
-        }
-        
-        .file-icon {
-            font-size: 3rem;
-            color: var(--secondary-color);
-        }
-        
-        .file-input-text {
-            font-size: 1.1rem;
-            color: var(--secondary-color);
-        }
-        
-        .file-input-hint {
-            font-size: 0.9rem;
-            color: #94a3b8;
-        }
-        
-        .submit-btn {
-            background-color: var(--primary-color);
-            color: white;
-            border: none;
-            border-radius: var(--border-radius);
-            padding: 1rem 2rem;
-            font-size: 1.1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .submit-btn:hover {
-            background-color: #2563eb;
-            transform: translateY(-2px);
-            box-shadow: 0 10px 15px -3px rgba(59, 130, 246, 0.3);
-        }
-        
-        .result {
-            text-align: center;
-        }
-        
-        .success-message {
-            color: var(--success-color);
-            font-size: 1.5rem;
-            font-weight: 600;
-            margin-bottom: 2rem;
-        }
-        
-        .link-container {
-            background-color: #f1f5f9;
-            border-radius: var(--border-radius);
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            text-align: left;
-        }
-        
-        .link-label {
-            font-size: 0.9rem;
-            color: var(--secondary-color);
-            margin-bottom: 0.5rem;
-            font-weight: 500;
-        }
-        
-        .link-box {
-            width: 100%;
-            padding: 0.75rem;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 0.9rem;
-            background-color: white;
-            margin-bottom: 1rem;
-        }
-        
-        .copy-btn {
-            background-color: var(--secondary-color);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 0.5rem 1rem;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .copy-btn:hover {
-            background-color: #475569;
-        }
-        
-        .qr-code {
-            margin: 2rem 0;
-            padding: 1.5rem;
-            background-color: white;
-            border-radius: var(--border-radius);
-            display: inline-block;
-            box-shadow: var(--box-shadow);
-        }
-        
-        .qr-code img {
-            max-width: 200px;
-            height: auto;
-        }
-        
-        .qr-code-label {
-            margin-bottom: 1rem;
-            font-size: 1.1rem;
-            font-weight: 500;
-            color: var(--text-color);
-        }
-        
-        .back-btn {
-            background-color: var(--secondary-color);
-            color: white;
-            border: none;
-            border-radius: var(--border-radius);
-            padding: 0.75rem 1.5rem;
-            font-size: 1rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 1rem;
-        }
-        
-        .back-btn:hover {
-            background-color: #475569;
-        }
-        
-        .file-preview {
-            margin-top: 1rem;
-            padding: 1rem;
-            background-color: #f1f5f9;
-            border-radius: 8px;
-        }
-        
-        .file-preview-info {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-        
-        .file-icon-large {
-            font-size: 2rem;
-        }
-        
-        .file-details {
-            flex: 1;
-        }
-        
-        .file-name {
-            font-weight: 500;
-            margin-bottom: 0.25rem;
-            word-break: break-all;
-        }
-        
-        .file-size {
-            font-size: 0.9rem;
-            color: var(--secondary-color);
-        }
-        
-        .remove-file {
-            background-color: #ef4444;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            width: 28px;
-            height: 28px;
-            font-size: 0.8rem;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        @media (max-width: 768px) {
-            body {
-                padding: 1rem;
-            }
-            
-            h1 {
-                font-size: 2rem;
-            }
-            
-            .card {
-                padding: 1.5rem;
-            }
-            
-            .file-input-container {
-                padding: 2rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>文件上传工具</h1>
-            <p class="subtitle">简单、快速地分享文件</p>
-        </header>
-        
-        <div class="card">
-            <form class="upload-form" action="/upload" method="post" enctype="multipart/form-data">
-                <div class="file-input-container">
-                    <input type="file" name="file" class="file-input" required>
-                    <div class="file-input-label">
-                        <div class="file-icon">📁</div>
-                        <div class="file-input-text">点击或拖拽文件到此处</div>
-                        <div class="file-input-hint">支持所有文件类型，最大 100MB</div>
-                    </div>
-                </div>
-                
-                <!-- 文件预览区域 -->
-                <div class="file-preview" id="filePreview" style="display: none;">
-                    <div class="file-preview-info">
-                        <div class="file-icon-large">📄</div>
-                        <div class="file-details">
-                            <div class="file-name" id="fileName"></div>
-                            <div class="file-size" id="fileSize"></div>
-                        </div>
-                        <button type="button" class="remove-file" onclick="removeFile()">✕</button>
-                    </div>
-                </div>
-                
-                <button type="submit" class="submit-btn">上传文件</button>
-            </form>
-        </div>
-
-        {{if .DownloadURL}}
-        <div class="card result">
-            <div class="success-message">上传成功！</div>
-            
-            <div class="link-container">
-                <div class="link-label">下载链接</div>
-                <input type="text" value="{{.DownloadURL}}" class="link-box" id="downloadLink" readonly>
-                <button class="copy-btn" onclick="copyLink()">复制链接</button>
-            </div>
-            
-            <div class="qr-code-section">
-                <div class="qr-code-label">扫码下载</div>
-                <div class="qr-code">
-                    <img src="/qr/{{.FileID}}" alt="下载二维码">
-                </div>
-            </div>
-            
-            <button class="back-btn" onclick="window.location.href='/'">返回上传</button>
-        </div>
-        {{end}}
-    </div>
-
-    <script>
-        // 复制链接功能
-        function copyLink() {
-            const input = document.getElementById('downloadLink');
-            input.select();
-            document.execCommand('copy');
-            alert('链接已复制！');
-        }
-        
-        // 文件预览功能
-        const fileInput = document.querySelector('.file-input');
-        const filePreview = document.getElementById('filePreview');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
-        
-        function formatFileSize(bytes) {
-            if (bytes < 1024) return bytes + ' B';
-            else if (bytes < 1048576) return (bytes / 1024).toFixed(2) + ' KB';
-            else return (bytes / 1048576).toFixed(2) + ' MB';
-        }
-        
-        function showFilePreview(file) {
-            fileName.textContent = file.name;
-            fileSize.textContent = formatFileSize(file.size);
-            filePreview.style.display = 'block';
-        }
-        
-        function hideFilePreview() {
-            filePreview.style.display = 'none';
-            fileName.textContent = '';
-            fileSize.textContent = '';
-        }
-        
-        // 文件选择事件
-        fileInput.addEventListener('change', function(e) {
-            if (e.target.files.length > 0) {
-                showFilePreview(e.target.files[0]);
-            } else {
-                hideFilePreview();
-            }
-        });
-        
-        // 移除文件
-        function removeFile() {
-            fileInput.value = '';
-            hideFilePreview();
-        }
-        
-        // 拖拽功能
-        const fileInputContainer = document.querySelector('.file-input-container');
-        
-        fileInputContainer.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            fileInputContainer.style.borderColor = '#3b82f6';
-            fileInputContainer.style.backgroundColor = 'rgba(59, 130, 246, 0.1)';
-        });
-        
-        fileInputContainer.addEventListener('dragleave', () => {
-            fileInputContainer.style.borderColor = '#cbd5e1';
-            fileInputContainer.style.backgroundColor = 'transparent';
-        });
-        
-        fileInputContainer.addEventListener('drop', (e) => {
-            e.preventDefault();
-            fileInputContainer.style.borderColor = '#cbd5e1';
-            fileInputContainer.style.backgroundColor = 'transparent';
-            
-            if (e.dataTransfer.files.length > 0) {
-                fileInput.files = e.dataTransfer.files;
-                showFilePreview(e.dataTransfer.files[0]);
-            }
-        });
-    </script>
-</body>
-</html>
-	`
-	// 解析并渲染模板（首次访问无数据，仅显示上传表单）
-	tpl, err := template.New("index").Parse(html)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("模板解析失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-	// 首次访问时 PageData 为空，仅显示上传表单
-	tpl.Execute(w, PageData{})
-}
-
-// 文件上传处理器：接收文件、生成唯一标识、存储文件、返回下载链接和二维码
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "仅支持 POST 方法", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// 解析上传的文件（限制文件大小为 100MB）
-	r.ParseMultipartForm(100 << 20)
-	file, fileHeader, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, fmt.Sprintf("获取文件失败：%v", err), http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	// 检查文件大小（限制为 100MB）
-	if fileHeader.Size > 100<<20 {
-		http.Error(w, "文件大小超过限制（100MB）", http.StatusBadRequest)
-		return
-	}
-
-	// 生成唯一标识（UUID），保留原文件后缀（避免下载后无扩展名）
-	fileExt := filepath.Ext(fileHeader.Filename)
-	fileID := uuid.New().String()
-	// 存储的文件名 = UUID + 原后缀
-	saveFileName := fileID + fileExt
-	savePath := filepath.Join(config.UploadDir, saveFileName)
-
-	// 创建文件并写入内容
-	outFile, err := os.Create(savePath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("创建文件失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-	defer outFile.Close()
-
-	// 复制上传的文件内容到本地文件
-	_, err = io.Copy(outFile, file)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("保存文件失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// 生成下载链接
-	downloadURL := fmt.Sprintf("%s/download/%s", config.PublicBaseURL, fileID)
-
-	// 生成二维码（Base64 格式，前端可直接显示）
-	qrCodeBytes, err := qrcode.Encode(downloadURL, qrcode.Medium, 256)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("生成二维码失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-	_ = qrCodeBytes // 二维码通过单独的API提供
-
-	// 渲染页面，传递下载链接和二维码
-	html := `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>文件上传工具</title>
-    <style>
-        :root {
-            --primary-color: #3b82f6;
-            --secondary-color: #64748b;
-            --background-color: #f8fafc;
-            --card-background: #ffffff;
-            --text-color: #1e293b;
-            --success-color: #10b981;
-            --border-radius: 12px;
-            --box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-        }
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background-color: var(--background-color);
-            color: var(--text-color);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 2rem;
-        }
-        
-        .container {
-            max-width: 600px;
-            width: 100%;
-            margin: 0 auto;
-        }
-        
-        header {
-            text-align: center;
-            margin-bottom: 3rem;
-        }
-        
-        h1 {
-            font-size: 2.5rem;
-            font-weight: 700;
-            color: var(--text-color);
-            margin-bottom: 0.5rem;
-        }
-        
-        .subtitle {
-            color: var(--secondary-color);
-            font-size: 1.1rem;
-        }
-        
-        .card {
-            background-color: var(--card-background);
-            border-radius: var(--border-radius);
-            box-shadow: var(--box-shadow);
-            padding: 2rem;
-            margin-bottom: 2rem;
-        }
-        
-        .upload-form {
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-        }
-        
-        .file-input-container {
-            position: relative;
-            border: 2px dashed #cbd5e1;
-            border-radius: var(--border-radius);
-            padding: 3rem;
-            text-align: center;
-            transition: all 0.3s ease;
-        }
-        
-        .file-input-container:hover {
-            border-color: var(--primary-color);
-            background-color: rgba(59, 130, 246, 0.05);
-        }
-        
-        .file-input {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            opacity: 0;
-            cursor: pointer;
-        }
-        
-        .file-input-label {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 1rem;
-        }
-        
-        .file-icon {
-            font-size: 3rem;
-            color: var(--secondary-color);
-        }
-        
-        .file-input-text {
-            font-size: 1.1rem;
-            color: var(--secondary-color);
-        }
-        
-        .file-input-hint {
-            font-size: 0.9rem;
-            color: #94a3b8;
-        }
-        
-        .submit-btn {
-            background-color: var(--primary-color);
-            color: white;
-            border: none;
-            border-radius: var(--border-radius);
-            padding: 1rem 2rem;
-            font-size: 1.1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .submit-btn:hover {
-            background-color: #2563eb;
-            transform: translateY(-2px);
-            box-shadow: 0 10px 15px -3px rgba(59, 130, 246, 0.3);
-        }
-        
-        .result {
-            text-align: center;
-        }
-        
-        .success-message {
-            color: var(--success-color);
-            font-size: 1.5rem;
-            font-weight: 600;
-            margin-bottom: 2rem;
-        }
-        
-        .link-container {
-            background-color: #f1f5f9;
-            border-radius: var(--border-radius);
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            text-align: left;
-        }
-        
-        .link-label {
-            font-size: 0.9rem;
-            color: var(--secondary-color);
-            margin-bottom: 0.5rem;
-            font-weight: 500;
-        }
-        
-        .link-box {
-            width: 100%;
-            padding: 0.75rem;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 0.9rem;
-            background-color: white;
-            margin-bottom: 1rem;
-        }
-        
-        .copy-btn {
-            background-color: var(--secondary-color);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 0.5rem 1rem;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .copy-btn:hover {
-            background-color: #475569;
-        }
-        
-        .qr-code {
-            margin: 2rem 0;
-            padding: 1.5rem;
-            background-color: white;
-            border-radius: var(--border-radius);
-            display: inline-block;
-            box-shadow: var(--box-shadow);
-        }
-        
-        .qr-code img {
-            max-width: 200px;
-            height: auto;
-        }
-        
-        .qr-code-label {
-            margin-bottom: 1rem;
-            font-size: 1.1rem;
-            font-weight: 500;
-            color: var(--text-color);
-        }
-        
-        .back-btn {
-            background-color: var(--secondary-color);
-            color: white;
-            border: none;
-            border-radius: var(--border-radius);
-            padding: 0.75rem 1.5rem;
-            font-size: 1rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 1rem;
-        }
-        
-        .back-btn:hover {
-            background-color: #475569;
-        }
-        
-        @media (max-width: 768px) {
-            body {
-                padding: 1rem;
-            }
-            
-            h1 {
-                font-size: 2rem;
-            }
-            
-            .card {
-                padding: 1.5rem;
-            }
-            
-            .file-input-container {
-                padding: 2rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>文件上传工具</h1>
-            <p class="subtitle">简单、快速地分享文件</p>
-        </header>
-        
-        <div class="card">
-            <form class="upload-form" action="/upload" method="post" enctype="multipart/form-data">
-                <div class="file-input-container">
-                    <input type="file" name="file" class="file-input" required>
-                    <div class="file-input-label">
-                        <div class="file-icon">📁</div>
-                        <div class="file-input-text">点击或拖拽文件到此处</div>
-                        <div class="file-input-hint">支持所有文件类型，最大 100MB</div>
-                    </div>
-                </div>
-                <button type="submit" class="submit-btn">开始上传</button>
-            </form>
-        </div>
-
-        {{if .DownloadURL}}
-        <div class="card result">
-            <div class="success-message">上传成功！</div>
-            
-            <div class="link-container">
-                <div class="link-label">下载链接</div>
-                <input type="text" value="{{.DownloadURL}}" class="link-box" id="downloadLink" readonly>
-                <button class="copy-btn" onclick="copyLink()">复制链接</button>
-            </div>
-            
-            <div class="qr-code-section">
-                <div class="qr-code-label">扫码下载</div>
-                <div class="qr-code">
-                    <img src="/qr/{{.FileID}}" alt="下载二维码">
-                </div>
-            </div>
-            
-            <button class="back-btn" onclick="window.location.href='/'">返回上传</button>
-        </div>
-        {{end}}
-    </div>
-
-    <script>
-        // 复制链接功能
-        function copyLink() {
-            const input = document.getElementById('downloadLink');
-            input.select();
-            document.execCommand('copy');
-            alert('链接已复制！');
-        }
-        
-        // 拖拽功能
-        const fileInputContainer = document.querySelector('.file-input-container');
-        const fileInput = document.querySelector('.file-input');
-        
-        fileInputContainer.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            fileInputContainer.style.borderColor = '#3b82f6';
-            fileInputContainer.style.backgroundColor = 'rgba(59, 130, 246, 0.1)';
-        });
-        
-        fileInputContainer.addEventListener('dragleave', () => {
-            fileInputContainer.style.borderColor = '#cbd5e1';
-            fileInputContainer.style.backgroundColor = 'transparent';
-        });
-        
-        fileInputContainer.addEventListener('drop', (e) => {
-            e.preventDefault();
-            fileInputContainer.style.borderColor = '#cbd5e1';
-            fileInputContainer.style.backgroundColor = 'transparent';
-            
-            if (e.dataTransfer.files.length > 0) {
-                fileInput.files = e.dataTransfer.files;
-            }
-        });
-    </script>
-</body>
-</html>
-	`
-	tpl, err := template.New("uploadResult").Parse(html)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("模板解析失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-	tpl.Execute(w, PageData{
-		DownloadURL: downloadURL,
-		FileID:      fileID,
+		log.Printf("%s %s %d %dB %s %s",
+			r.Method, r.URL.Path, rec.status, rec.bytes,
+			time.Since(start).Round(time.Millisecond), clientIP(r))
 	})
 }
 
-// 文件下载处理器：根据文件 ID 查找文件并返回下载
-func downloadHandler(w http.ResponseWriter, r *http.Request) {
-	// 提取 URL 中的文件 ID（例如 /download/123456 → 123456）
-	fileID := strings.TrimPrefix(r.URL.Path, "/download/")
-	if fileID == "" {
-		http.Error(w, "文件 ID 不能为空", http.StatusBadRequest)
-		return
-	}
-
-	// 优化：直接尝试常见的文件扩展名，避免遍历整个目录
-	// 常见文件扩展名列表
-	extensions := []string{".jpg", ".jpeg", ".png", ".gif", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".zip", ".rar", ".7z", ".exe", ".mp3", ".mp4", ".avi", ".mov"}
-
-	var targetFile string
-	// 先尝试常见扩展名
-	for _, ext := range extensions {
-		tryPath := filepath.Join(config.UploadDir, fileID+ext)
-		if _, err := os.Stat(tryPath); err == nil {
-			targetFile = tryPath
-			break
-		}
-	}
-
-	// 如果常见扩展名没找到，再遍历目录（作为 fallback）
-	if targetFile == "" {
-		err := filepath.Walk(config.UploadDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
+// recoverer 捕获处理器里的 panic，避免整个进程退出。
+func (a *App) recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic: %v (%s %s)", rec, r.Method, r.URL.Path)
+				http.Error(w, "服务器内部错误", http.StatusInternalServerError)
 			}
-			if !info.IsDir() && strings.HasPrefix(info.Name(), fileID) {
-				targetFile = path
-				return filepath.SkipAll // 找到后停止遍历
-			}
-			return nil
-		})
-		if err != nil || targetFile == "" {
-			http.Error(w, "文件不存在", http.StatusNotFound)
-			return
-		}
-	}
-
-	// 获取文件名
-	originalFileName := filepath.Base(targetFile)
-
-	// 设置响应头，触发浏览器下载（而非直接打开）
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", originalFileName))
-	w.Header().Set("Content-Type", "application/octet-stream")
-
-	// 读取文件并写入响应
-	http.ServeFile(w, r, targetFile)
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
-// 二维码处理器：根据URL生成并返回二维码图片
-func qrHandler(w http.ResponseWriter, r *http.Request) {
-	// 提取 URL 参数
-	fileID := strings.TrimPrefix(r.URL.Path, "/qr/")
-	if fileID == "" {
-		http.Error(w, "文件 ID 不能为空", http.StatusBadRequest)
-		return
-	}
-
-	// 生成完整的下载链接
-	downloadURL := fmt.Sprintf("%s/download/%s", config.PublicBaseURL, fileID)
-
-	// 生成二维码
-	qrCodeBytes, err := qrcode.Encode(downloadURL, qrcode.Medium, 256)
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("生成二维码失败：%v", err), http.StatusInternalServerError)
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// render 执行模板并把结果先写入缓冲区，
+// 这样模板出错时还能返回 500 而不是半截 HTML。
+func (a *App) render(w http.ResponseWriter, status int, name string, data any) {
+	var buf bytes.Buffer
+	if err := a.tpl.ExecuteTemplate(&buf, name, data); err != nil {
+		log.Printf("渲染模板 %s 失败: %v", name, err)
+		http.Error(w, "页面渲染失败", http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = buf.WriteTo(w)
+}
 
-	// 设置响应头
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+func main() {
+	log.SetFlags(log.LstdFlags)
 
-	// 返回二维码图片
-	w.Write(qrCodeBytes)
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+
+	app, err := newApp(cfg)
+	if err != nil {
+		log.Fatalf("初始化失败: %v", err)
+	}
+
+	ln, addr, err := listen(cfg, log.Printf)
+	if err != nil {
+		log.Fatalf("启动失败: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+	app.port = port
+
+	// 探测局域网地址，用于控制台提示、首页展示和 localhost 访问时的链接替换。
+	if cfg.PublicBaseURL == "" {
+		if ip := detectLANIP(); ip != "" {
+			app.lanIP = ip
+			app.lanURL = fmt.Sprintf("http://%s", net.JoinHostPort(ip, portStr))
+		}
+	}
+
+	srv := &http.Server{
+		Handler:           app.routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       0, // 上传大文件耗时不定，不设整体读超时
+		WriteTimeout:      0, // 下载同理；改用 IdleTimeout 清理空闲连接
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	// 收到中断信号后优雅关闭，等待在途请求完成。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+
+	log.Printf("服务已启动，监听 %s", addr)
+	log.Printf("  本机访问:   http://localhost:%d", port)
+	if app.lanURL != "" {
+		log.Printf("  局域网访问: %s", app.lanURL)
+		log.Printf("  （手机连同一个 Wi-Fi 后用上面的局域网地址，或直接扫首页二维码）")
+	} else {
+		log.Printf("  局域网访问: 未探测到可用的局域网 IPv4 地址")
+	}
+	log.Printf("  上传目录:   %s", app.store.Dir())
+	if cfg.PublicBaseURL != "" {
+		log.Printf("  链接前缀:   %s（config 中已固定）", app.publicBaseURL)
+	} else {
+		log.Printf("  链接前缀:   按访问来源自动适配")
+	}
+
+	// 服务已经起来后再开浏览器，避免页面先于服务加载失败。
+	if cfg.OpenBrowser {
+		go func() {
+			// 留一点时间让 Serve 进入监听循环。
+			time.Sleep(150 * time.Millisecond)
+			url := fmt.Sprintf("http://localhost:%d", port)
+			if err := openBrowser(url); err != nil {
+				log.Printf("自动打开浏览器失败（可手动访问 %s）: %v", url, err)
+			} else {
+				log.Printf("已自动打开浏览器: %s", url)
+			}
+		}()
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("服务异常退出: %v", err)
+		}
+	case <-ctx.Done():
+		log.Println("正在关闭服务…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("优雅关闭失败: %v", err)
+		}
+		log.Println("服务已停止")
+	}
 }

@@ -1,0 +1,412 @@
+{{define "index"}}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手机电脑局域网互传文件 · 极速版</title>
+    {{template "style" .}}
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>手机电脑局域网互传文件 · 极速版</h1>
+        </header>
+
+        {{if .Error}}<div class="alert">{{.Error}}</div>{{end}}
+        {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+
+        <div class="card top-card">
+            <div class="top-grid">
+                <div class="top-info">
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <div class="info-label">局域网地址</div>
+                            <div class="info-value">{{if .LANURL}}{{.LANURL}}{{else}}未探测到{{end}}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">本机地址</div>
+                            <div class="info-value">{{.LocalURL}}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">端口</div>
+                            <div class="info-value">{{.Port}}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">已存文件</div>
+                            <div class="info-value">{{.FileCount}} 个 · {{.TotalSize}}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">存储目录</div>
+                            <div class="info-value mono">{{.UploadDir}}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">运行平台</div>
+                            <div class="info-value">{{.OS}}</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="top-qr">
+                    <img src="/site-qr" alt="手机扫码访问" width="150" height="150">
+                    <div class="qr-caption">手机扫码即可互传</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <label class="drop-zone" id="dropZone">
+                <input type="file" id="fileInput" multiple>
+                <span class="drop-icon">📁</span>
+                <span class="drop-title">点击选择文件，或拖拽到此处</span>
+                <span class="drop-hint">选中后自动开始上传 · 支持多选 · 不限大小</span>
+            </label>
+
+            <div class="progress-block" id="uploadProgress" style="display:none;">
+                <div class="progress-meta">
+                    <span id="uploadText">准备上传…</span>
+                    <span id="uploadPercent">0%</span>
+                </div>
+                <div class="progress-track"><div class="progress-fill" id="uploadFill"></div></div>
+                <div class="progress-meta muted">
+                    <span id="uploadBytes"></span>
+                    <span id="uploadSpeed"></span>
+                </div>
+            </div>
+
+            <div id="queue" class="queue"></div>
+        </div>
+
+        <div class="tabs">
+            <a class="tab {{if eq .View "files"}}active{{end}}" href="/?size={{.Size}}">文件（{{.FileCount}}）</a>
+            <a class="tab {{if eq .View "trash"}}active{{end}}" href="/?view=trash&size={{.Size}}">回收站（{{.TrashN}}）</a>
+        </div>
+
+        {{if eq .View "files"}}
+        <div class="card">
+            <form method="post" action="/delete" id="filesForm">
+                <input type="hidden" name="size" value="{{.Size}}">
+                <input type="hidden" name="page" value="{{.Page}}">
+
+                <div class="list-head">
+                    <div class="card-title" style="margin-bottom:0;">文件列表</div>
+                    <div class="list-actions">
+                        <input type="text" class="search-box" id="searchBox" placeholder="筛选文件名…">
+                        <select class="size-select" onchange="location.href='/?size='+this.value">
+                            {{range .Sizes}}
+                            <option value="{{.}}" {{if eq . $.Size}}selected{{end}}>{{.}} 条/页</option>
+                            {{end}}
+                        </select>
+                    </div>
+                </div>
+
+                {{if .List.Files}}
+                <div class="bulk-bar">
+                    <label class="check-all"><input type="checkbox" id="checkAll"> 全选</label>
+                    <button type="submit" class="btn-danger" onclick="return confirm('选中的文件将移入回收站，确定吗？')">删除选中</button>
+                    <span class="bulk-count" id="bulkCount"></span>
+                </div>
+
+                <div class="file-list" id="fileList">
+                    {{range .List.Files}}
+                    <div class="file-row" data-name="{{.Name}}">
+                        <input type="checkbox" class="row-check" name="id" value="{{.ID}}">
+                        <div class="file-ext">{{if .Ext}}{{.Ext}}{{else}}file{{end}}</div>
+                        <div class="file-main">
+                            <div class="file-title">{{.Name}}</div>
+                            <div class="file-meta">{{.SizeText}} · {{.TimeText}}</div>
+                        </div>
+                        <div class="file-actions">
+                            <a class="dl-btn" href="/download/{{.ID}}" download>下载</a>
+                            <a class="dl-btn ghost" href="/d/{{.ID}}" title="显示进度条">进度</a>
+                        </div>
+                    </div>
+                    {{end}}
+                </div>
+
+                {{if gt .List.Pages 1}}
+                <div class="pager">
+                    {{if gt .List.Page 1}}
+                    <a class="page-btn" href="/?page={{sub .List.Page 1}}&size={{.Size}}">上一页</a>
+                    {{end}}
+                    {{range .Pages}}
+                    <a class="page-btn {{if eq . $.List.Page}}active{{end}}" href="/?page={{.}}&size={{$.Size}}">{{.}}</a>
+                    {{end}}
+                    {{if lt .List.Page .List.Pages}}
+                    <a class="page-btn" href="/?page={{add .List.Page 1}}&size={{.Size}}">下一页</a>
+                    {{end}}
+                    <span class="page-info">共 {{.List.Total}} 个，第 {{.List.Page}}/{{.List.Pages}} 页</span>
+                </div>
+                {{end}}
+
+                {{else}}
+                <div class="empty-list">
+                    <div class="empty-icon">📭</div>
+                    <p>还没有文件。用上面的上传区传一个，或让手机扫码后上传。</p>
+                </div>
+                {{end}}
+            </form>
+        </div>
+
+        {{else}}
+        <div class="card">
+            <form method="post" action="/purge">
+                <div class="list-head">
+                    <div class="card-title" style="margin-bottom:0;">回收站</div>
+                    <div class="list-actions">
+                        <span class="trash-usage">{{.TrashN}} 个 · 占用 {{.TrashSize}}</span>
+                    </div>
+                </div>
+
+                {{if .Trash.Files}}
+                <div class="bulk-bar">
+                    <label class="check-all"><input type="checkbox" id="checkAll"> 全选</label>
+                    <button type="submit" class="btn-danger" onclick="return confirm('彻底删除后无法恢复，确定吗？')">彻底删除选中</button>
+                    <span class="bulk-count" id="bulkCount"></span>
+                </div>
+
+                <div class="file-list" id="fileList">
+                    {{range .Trash.Files}}
+                    <div class="file-row deleted" data-name="{{.Name}}">
+                        <input type="checkbox" class="row-check" name="id" value="{{.ID}}">
+                        <div class="file-ext">{{if .Ext}}{{.Ext}}{{else}}file{{end}}</div>
+                        <div class="file-main">
+                            <div class="file-title">{{.Name}}</div>
+                            <div class="file-meta">{{.SizeText}} · 删除于 {{.DeletedTxt}}</div>
+                        </div>
+                        <div class="file-actions">
+                            <button type="submit" class="dl-btn" formaction="/restore" formnovalidate title="还原到文件列表">还原</button>
+                        </div>
+                    </div>
+                    {{end}}
+                </div>
+                {{else}}
+                <div class="empty-list">
+                    <div class="empty-icon">🗑️</div>
+                    <p>回收站是空的。</p>
+                </div>
+                {{end}}
+            </form>
+
+            {{if .Trash.Files}}
+            <form method="post" action="/purge-all" style="margin-top:1.25rem;text-align:right;">
+                <button type="submit" class="btn-danger" onclick="return confirm('将彻底删除回收站里的全部 {{.TrashN}} 个文件，无法恢复，确定吗？')">一键清空回收站</button>
+            </form>
+            {{end}}
+        </div>
+        {{end}}
+
+        <p class="footer-note">关掉此窗口不影响服务；需要停止请在程序窗口按 Ctrl+C。</p>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const dropZone = document.getElementById('dropZone');
+        const progressBlock = document.getElementById('uploadProgress');
+        const progressFill = document.getElementById('uploadFill');
+        const percentEl = document.getElementById('uploadPercent');
+        const textEl = document.getElementById('uploadText');
+        const bytesEl = document.getElementById('uploadBytes');
+        const speedEl = document.getElementById('uploadSpeed');
+        const queueEl = document.getElementById('queue');
+        const searchBox = document.getElementById('searchBox');
+        const fileList = document.getElementById('fileList');
+        const checkAll = document.getElementById('checkAll');
+        const bulkCount = document.getElementById('bulkCount');
+
+        let uploading = false;
+        let uploadedAny = false;
+
+        // 按文件名筛选，纯前端
+        if (searchBox && fileList) {
+            searchBox.addEventListener('input', function () {
+                const kw = searchBox.value.trim().toLowerCase();
+                fileList.querySelectorAll('.file-row').forEach(function (row) {
+                    const name = (row.dataset.name || '').toLowerCase();
+                    row.style.display = !kw || name.indexOf(kw) !== -1 ? '' : 'none';
+                });
+            });
+        }
+
+        // 全选 / 反选，并显示已选数量
+        function refreshCount() {
+            if (!bulkCount) return;
+            const checked = fileList ? fileList.querySelectorAll('.row-check:checked').length : 0;
+            bulkCount.textContent = checked > 0 ? '已选 ' + checked + ' 个' : '';
+        }
+
+        if (checkAll && fileList) {
+            checkAll.addEventListener('change', function () {
+                fileList.querySelectorAll('.row-check').forEach(function (cb) {
+                    if (cb.closest('.file-row').style.display !== 'none') {
+                        cb.checked = checkAll.checked;
+                    }
+                });
+                refreshCount();
+            });
+            fileList.addEventListener('change', function (e) {
+                if (e.target.classList.contains('row-check')) {
+                    const boxes = Array.from(fileList.querySelectorAll('.row-check'));
+                    const visible = boxes.filter(function (cb) { return cb.closest('.file-row').style.display !== 'none'; });
+                    checkAll.checked = visible.length > 0 && visible.every(function (cb) { return cb.checked; });
+                    refreshCount();
+                }
+            });
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(2) + ' KB';
+            if (bytes < 1073741824) return (bytes / 1048576).toFixed(2) + ' MB';
+            return (bytes / 1073741824).toFixed(2) + ' GB';
+        }
+
+        function formatSpeed(bps) {
+            if (!isFinite(bps) || bps <= 0) return '';
+            return formatFileSize(bps) + '/s';
+        }
+
+        function addQueueItem(file) {
+            const item = document.createElement('div');
+            item.className = 'queue-item';
+            item.innerHTML = '<span class="queue-icon">📄</span>' +
+                '<span class="queue-body"><span class="queue-name"></span>' +
+                '<span class="queue-sub"></span></span>';
+            item.querySelector('.queue-name').textContent = file.name;
+            item.querySelector('.queue-sub').textContent = formatFileSize(file.size);
+            queueEl.prepend(item);
+            return item;
+        }
+
+        function uploadFile(file) {
+            return new Promise(function (resolve) {
+                const item = addQueueItem(file);
+                const sub = item.querySelector('.queue-sub');
+
+                const data = new FormData();
+                data.append('file', file);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/upload', true);
+
+                progressBlock.style.display = 'block';
+                progressFill.style.width = '0';
+                percentEl.textContent = '0%';
+                textEl.textContent = '正在上传：' + file.name;
+                bytesEl.textContent = '0 B / ' + formatFileSize(file.size);
+                speedEl.textContent = '';
+
+                let lastTick = performance.now();
+                let lastBytes = 0;
+
+                xhr.upload.addEventListener('progress', function (ev) {
+                    if (!ev.lengthComputable) return;
+                    const pct = Math.min(100, ev.loaded / ev.total * 100);
+                    progressFill.style.width = pct + '%';
+                    percentEl.textContent = pct.toFixed(pct >= 99.95 ? 0 : 1) + '%';
+                    bytesEl.textContent = formatFileSize(ev.loaded) + ' / ' + formatFileSize(ev.total);
+
+                    const now = performance.now();
+                    if (now - lastTick > 300) {
+                        const speed = (ev.loaded - lastBytes) / ((now - lastTick) / 1000);
+                        speedEl.textContent = formatSpeed(speed);
+                        if (speed > 0 && ev.loaded < ev.total) {
+                            textEl.textContent = '剩余 ' + Math.ceil((ev.total - ev.loaded) / speed) + ' 秒';
+                        }
+                        lastTick = now;
+                        lastBytes = ev.loaded;
+                    }
+                });
+
+                xhr.upload.addEventListener('load', function () {
+                    textEl.textContent = '正在保存：' + file.name;
+                    speedEl.textContent = '';
+                });
+
+                xhr.addEventListener('load', function () {
+                    if (xhr.status === 200 || xhr.status === 303) {
+                        item.classList.add('done');
+                        sub.textContent = formatFileSize(file.size) + ' · 已上传';
+                        uploadedAny = true;
+                    } else {
+                        item.classList.add('failed');
+                        sub.textContent = (xhr.responseText || '上传失败').slice(0, 120);
+                    }
+                    resolve();
+                });
+
+                xhr.addEventListener('error', function () {
+                    item.classList.add('failed');
+                    sub.textContent = '网络错误，上传失败';
+                    resolve();
+                });
+
+                xhr.addEventListener('abort', function () {
+                    item.classList.add('failed');
+                    sub.textContent = '已取消';
+                    resolve();
+                });
+
+                xhr.send(data);
+            });
+        }
+
+        async function uploadFiles(files) {
+            if (!files || !files.length || uploading) return;
+            uploading = true;
+            dropZone.classList.add('disabled');
+
+            const list = Array.from(files);
+            for (let i = 0; i < list.length; i++) {
+                textEl.textContent = '正在上传 ' + (i + 1) + ' / ' + list.length;
+                await uploadFile(list[i]);
+            }
+
+            progressFill.style.width = '100%';
+            percentEl.textContent = '100%';
+            textEl.textContent = '全部完成（' + list.length + ' 个文件）';
+            speedEl.textContent = '';
+            bytesEl.textContent = '';
+
+            uploading = false;
+            dropZone.classList.remove('disabled');
+
+            // 上传完成后刷新，让新文件出现在列表里
+            if (uploadedAny) {
+                uploadedAny = false;
+                setTimeout(function () { window.location.reload(); }, 800);
+            }
+        }
+
+        fileInput.addEventListener('change', function (e) {
+            uploadFiles(e.target.files);
+            e.target.value = '';
+        });
+
+        ['dragover', 'dragenter'].forEach(function (name) {
+            dropZone.addEventListener(name, function (e) {
+                e.preventDefault();
+                if (!uploading) dropZone.classList.add('dragover');
+            });
+        });
+
+        ['dragleave', 'dragend', 'drop'].forEach(function (name) {
+            dropZone.addEventListener(name, function () {
+                dropZone.classList.remove('dragover');
+            });
+        });
+
+        dropZone.addEventListener('drop', function (e) {
+            e.preventDefault();
+            if (uploading) return;
+            if (e.dataTransfer.files.length > 0) {
+                uploadFiles(e.dataTransfer.files);
+            }
+        });
+
+        ['dragover', 'drop'].forEach(function (name) {
+            window.addEventListener(name, function (e) { e.preventDefault(); });
+        });
+    </script>
+</body>
+</html>
+{{end}}

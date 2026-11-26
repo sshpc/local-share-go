@@ -1,0 +1,23 @@
+{{define "error"}}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}} - 局域网互传</title>
+    {{template "style" .}}
+</head>
+<body>
+    <div class="container">
+        <div class="card" style="text-align:center;">
+            <div class="empty-icon">🔒</div>
+            <h2 style="font-size:1.25rem;margin-bottom:0.75rem;">{{.Title}}</h2>
+            <p style="color:var(--secondary-color);font-size:0.9rem;line-height:1.8;">{{.Message}}</p>
+            <div style="margin-top:1.5rem;">
+                <a href="/"><button class="back-btn" type="button" style="margin-top:0;">返回首页</button></a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+{{end}}

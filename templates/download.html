@@ -1,0 +1,220 @@
+{{define "download"}}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>下载 {{.FileName}} - 文件上传工具</title>
+    {{template "style" .}}
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>文件下载</h1>
+            <p class="subtitle">进度实时显示</p>
+        </header>
+
+        <div class="card">
+            <div class="file-preview visible" style="margin-top: 0; margin-bottom: 1.5rem;">
+                <div class="file-preview-info">
+                    <div class="file-icon" style="font-size: 2rem;">📄</div>
+                    <div class="file-details">
+                        <div class="file-name">{{.FileName}}</div>
+                        <div class="file-size">{{.FileSize}}</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="progress-block" id="progressBlock">
+                <div class="progress-meta">
+                    <span id="progressText">准备中…</span>
+                    <span id="progressPercent">0%</span>
+                </div>
+                <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+                <div class="progress-meta muted">
+                    <span id="progressBytes">0 B / {{.FileSize}}</span>
+                    <span id="progressSpeed"></span>
+                </div>
+            </div>
+
+            <div class="action-row">
+                <button class="submit-btn" id="startBtn" data-id="{{.FileID}}" data-size="{{.SizeBytes}}">下载</button>
+                <a class="link-btn" id="directLink" href="{{.RawURL}}">用浏览器直接下载</a>
+            </div>
+
+            <div class="alert" id="errorBox" style="display:none;"></div>
+
+            <p class="hint-text">
+                「下载」会在页面内显示实时进度、速度与剩余时间；
+                「用浏览器直接下载」交给浏览器自带的下载管理器，适合超大文件。
+            </p>
+
+            <div class="action-row" style="margin-top: 1.5rem;">
+                <a href="/"><button class="back-btn" type="button" style="margin-top:0;">继续上传</button></a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            const btn = document.getElementById('startBtn');
+            const fill = document.getElementById('progressFill');
+            const percentEl = document.getElementById('progressPercent');
+            const textEl = document.getElementById('progressText');
+            const bytesEl = document.getElementById('progressBytes');
+            const speedEl = document.getElementById('progressSpeed');
+            const errorBox = document.getElementById('errorBox');
+            const directLink = document.getElementById('directLink');
+
+            const fileId = btn.dataset.id;
+            const totalSize = Number(btn.dataset.size) || 0;
+
+            function humanSize(bytes) {
+                if (bytes < 1024) return bytes + ' B';
+                if (bytes < 1048576) return (bytes / 1024).toFixed(2) + ' KB';
+                if (bytes < 1073741824) return (bytes / 1048576).toFixed(2) + ' MB';
+                return (bytes / 1073741824).toFixed(2) + ' GB';
+            }
+
+            function humanSpeed(bytesPerSec) {
+                if (!isFinite(bytesPerSec) || bytesPerSec <= 0) return '';
+                return humanSize(bytesPerSec) + '/s';
+            }
+
+            function humanTime(seconds) {
+                if (!isFinite(seconds) || seconds < 0) return '';
+                if (seconds < 1) return '即将完成';
+                if (seconds < 60) return Math.ceil(seconds) + ' 秒';
+                const m = Math.floor(seconds / 60);
+                const s = Math.round(seconds % 60);
+                return m + ' 分 ' + s + ' 秒';
+            }
+
+            function setProgress(received, total) {
+                const pct = total > 0 ? Math.min(100, received / total * 100) : 0;
+                fill.style.width = pct + '%';
+                percentEl.textContent = pct.toFixed(pct >= 99.95 ? 0 : 1) + '%';
+                bytesEl.textContent = humanSize(received) + ' / ' + humanSize(total || totalSize);
+            }
+
+            function fail(message) {
+                errorBox.textContent = message;
+                errorBox.style.display = 'block';
+                textEl.textContent = '下载失败';
+                btn.disabled = false;
+                btn.textContent = '重试';
+            }
+
+            btn.addEventListener('click', async function () {
+                btn.disabled = true;
+                btn.textContent = '下载中…';
+                errorBox.style.display = 'none';
+                speedEl.textContent = '';
+                textEl.textContent = '正在连接…';
+
+                const startedAt = performance.now();
+                let received = 0;
+                let total = totalSize;
+                let lastTick = startedAt;
+                let lastBytes = 0;
+
+                try {
+                    const response = await fetch('/download/' + fileId, { cache: 'no-store' });
+                    if (!response.ok) {
+                        throw new Error('服务器返回 ' + response.status);
+                    }
+
+                    // 有 Content-Length 就用它，没有也能按已收字节继续展示
+                    const lenHeader = response.headers.get('Content-Length');
+                    if (lenHeader) total = Number(lenHeader);
+
+                    textEl.textContent = '下载中…';
+
+                    if (!response.body || !window.ReadableStream) {
+                        // 老浏览器：退回一次性读取
+                        const blob = await response.blob();
+                        received = blob.size;
+                        setProgress(received, received);
+                        await save(blob);
+                        return;
+                    }
+
+                    const reader = response.body.getReader();
+                    const chunks = [];
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        received += value.length;
+                        setProgress(received, total);
+
+                        const now = performance.now();
+                        if (now - lastTick > 250) {
+                            const speed = (received - lastBytes) / ((now - lastTick) / 1000);
+                            speedEl.textContent = humanSpeed(speed);
+                            if (total > 0 && speed > 0) {
+                                const remain = (total - received) / speed;
+                                textEl.textContent = '剩余 ' + humanTime(remain);
+                            }
+                            lastTick = now;
+                            lastBytes = received;
+                        }
+                    }
+
+                    textEl.textContent = '正在保存…';
+                    speedEl.textContent = '';
+                    setProgress(received, received || total);
+
+                    const blob = new Blob(chunks);
+                    await save(blob);
+                } catch (err) {
+                    fail('下载失败：' + (err && err.message ? err.message : err));
+                }
+            });
+
+            async function save(blob) {
+                // 优先走 File System Access API，直接弹出「另存为」；
+                // 不支持时退回 Blob URL + a[download]。
+                if (window.showSaveFilePicker) {
+                    try {
+                        const handle = await window.showSaveFilePicker({
+                            suggestedName: directLink.closest('.card').querySelector('.file-name').textContent
+                        });
+                        const writable = await handle.createWritable();
+                        await writable.write(blob);
+                        await writable.close();
+                        textEl.textContent = '已保存';
+                        percentEl.textContent = '100%';
+                        btn.textContent = '已保存';
+                        return;
+                    } catch (err) {
+                        if (err && err.name === 'AbortError') {
+                            // 用户取消保存，保留已下载的数据提示重试
+                            btn.disabled = false;
+                            btn.textContent = '重新下载';
+                            textEl.textContent = '已取消保存';
+                            return;
+                        }
+                        // 其他错误（如不支持）退回默认方式
+                    }
+                }
+
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = document.querySelector('.file-name').textContent;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+
+                textEl.textContent = '已保存';
+                percentEl.textContent = '100%';
+                btn.textContent = '已保存';
+            }
+        })();
+    </script>
+</body>
+</html>
+{{end}}

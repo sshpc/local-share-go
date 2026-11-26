@@ -1,0 +1,68 @@
+{{define "result"}}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>上传成功 - 文件上传工具</title>
+    {{template "style" .}}
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>文件上传工具</h1>
+            <p class="subtitle">简单、快速地分享文件</p>
+        </header>
+
+        <div class="card result">
+            <div class="success-message">上传成功！</div>
+            <p class="result-filename">{{.FileName}} · {{.FileSize}}</p>
+
+            <div class="link-container">
+                <div class="link-label">下载链接</div>
+                <div class="link-row">
+                    <input type="text" value="{{.DownloadURL}}" class="link-box" id="downloadLink" readonly>
+                    <button class="copy-btn" onclick="copyLink()">复制</button>
+                </div>
+            </div>
+
+            <div class="action-row" style="justify-content: center; margin-bottom: 1.5rem;">
+                <a href="/d/{{.FileID}}"><button class="submit-btn" type="button">下载</button></a>
+            </div>
+
+            <div class="qr-code-label">扫码下载</div>
+            <div class="qr-code">
+                <img src="/qr/{{.FileID}}" alt="下载二维码" width="200" height="200">
+            </div>
+
+            <div>
+                <a href="/"><button class="back-btn" type="button">继续上传</button></a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function copyLink() {
+            const input = document.getElementById('downloadLink');
+            const done = function () {
+                const btn = document.querySelector('.copy-btn');
+                const old = btn.textContent;
+                btn.textContent = '已复制';
+                setTimeout(function () { btn.textContent = old; }, 1500);
+            };
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(input.value).then(done, function () {
+                    input.select();
+                    document.execCommand('copy');
+                    done();
+                });
+            } else {
+                input.select();
+                document.execCommand('copy');
+                done();
+            }
+        }
+    </script>
+</body>
+</html>
+{{end}}
